@@ -54,8 +54,25 @@ func init() {
 	}
 }
 
+type Networker interface {
+	DoNetworking(
+		args *skel.CmdArgs,
+		conf types.NetConf,
+		result *current.Result,
+		logger *logrus.Entry,
+		desiredVethName string,
+		routes []*net.IPNet,
+	) (hostVethName, contVethMAC string, err error)
+}
+
+type networker struct{}
+
+func NewNetworker() Networker {
+	return &networker{}
+}
+
 // DoNetworking performs the networking for the given config and IPAM result
-func DoNetworking(
+func (*networker) DoNetworking(
 	args *skel.CmdArgs,
 	conf types.NetConf,
 	result *current.Result,

@@ -96,9 +96,21 @@ func CreateOrUpdate(ctx context.Context, client client.Interface, wep *api.Workl
 	return client.WorkloadEndpoints().Create(ctx, wep, options.SetOptions{})
 }
 
+type IPAMer interface {
+	AddIPAM(conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*current.Result, error)
+	DeleteIPAM(conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) error
+	ReleaseIPAllocation(logger *logrus.Entry, conf types.NetConf, args *skel.CmdArgs)
+}
+
+type ipamer struct{}
+
+func NewIPAMer() IPAMer {
+	return &ipamer{}
+}
+
 // AddIPAM calls through to the configured IPAM plugin.
 // It also contains IPAM plugin specific logic based on the configured plugin.
-func AddIPAM(conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*current.Result, error) {
+func (*ipamer) AddIPAM(conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*current.Result, error) {
 	// Check if we're configured to use the Azure IPAM plugin.
 	var an *azure.AzureNetwork
 	if conf.IPAM.Type == "azure-vnet-ipam" {
@@ -164,7 +176,7 @@ func AddIPAM(conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) (*cur
 // DeleteIPAM calls IPAM plugin to release the IP address.
 // It also contains IPAM plugin specific logic based on the configured plugin,
 // and is the logical counterpart to AddIPAM.
-func DeleteIPAM(conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) error {
+func (*ipamer) DeleteIPAM(conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) error {
 	logger.Info("Calico CNI releasing IP address")
 	logger.WithFields(logrus.Fields{"paths": os.Getenv("CNI_PATH"),
 		"type": conf.IPAM.Type}).Debug("Looking for IPAM plugin in paths")
@@ -231,6 +243,21 @@ func DeleteIPAM(conf types.NetConf, args *skel.CmdArgs, logger *logrus.Entry) er
 	}
 
 	return err
+}
+
+// ReleaseIPAllocation is called to cleanup IPAM allocations if something goes wrong during
+// CNI ADD execution. It forces the CNI_COMMAND to be DEL.
+func (i *ipamer) ReleaseIPAllocation(logger *logrus.Entry, conf types.NetConf, args *skel.CmdArgs) {
+	logger.Info("Cleaning up IP allocations for failed ADD")
+	if err := os.Setenv("CNI_COMMAND", "DEL"); err != nil {
+		// Failed to set CNI_COMMAND to DEL.
+		logger.Warning("Failed to set CNI_COMMAND=DEL")
+	} else {
+		if err := i.DeleteIPAM(conf, args, logger); err != nil {
+			// Failed to cleanup the IP allocation.
+			logger.Warning("Failed to clean up IP allocations for failed ADD")
+		}
+	}
 }
 
 // ReplaceHostLocalIPAMPodCIDRs extracts the host-local IPAM config section and replaces our special-case "usePodCidr"
@@ -542,21 +569,6 @@ func CreateClient(conf types.NetConf) (client.Interface, error) {
 		return nil, err
 	}
 	return calicoClient, nil
-}
-
-// ReleaseIPAllocation is called to cleanup IPAM allocations if something goes wrong during
-// CNI ADD execution. It forces the CNI_COMMAND to be DEL.
-func ReleaseIPAllocation(logger *logrus.Entry, conf types.NetConf, args *skel.CmdArgs) {
-	logger.Info("Cleaning up IP allocations for failed ADD")
-	if err := os.Setenv("CNI_COMMAND", "DEL"); err != nil {
-		// Failed to set CNI_COMMAND to DEL.
-		logger.Warning("Failed to set CNI_COMMAND=DEL")
-	} else {
-		if err := DeleteIPAM(conf, args, logger); err != nil {
-			// Failed to cleanup the IP allocation.
-			logger.Warning("Failed to clean up IP allocations for failed ADD")
-		}
-	}
 }
 
 // Set up logging for both Calico and libcalico using the provided log level,

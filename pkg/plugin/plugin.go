@@ -22,7 +22,10 @@ import (
 	"io/ioutil"
 	"os"
 	"runtime"
+	"strings"
 	"time"
+
+	"github.com/projectcalico/libcalico-go/lib/clientv3"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
@@ -106,13 +109,88 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to load netconf: %v", err)
 	}
 
-	utils.ConfigureLogging(conf.LogLevel)
+	utils.ConfigureLogging("debug")
+
+	calicoClient, err := utils.CreateClient(conf)
+	if err != nil {
+		return err
+	}
+
+	// Allocate the IP and update/create the endpoint. Do this even if the endpoint already exists and has an IP
+	// allocation. The kubelet will send a DEL call for any old containers and we'll clean up the old IPs then.
+	client, err := newK8sClient(conf)
+	if err != nil {
+		return err
+	}
+
+	result, cniVersion, err := cmdAddInternal(args, calicoClient, client, utils.NewIPAMer(), utils.NewNetworker())
+
+	logrus.WithField("result", result).Info("brianreallymark")
+	if err != nil {
+		return err
+	}
+	return cnitypes.PrintResult(result, cniVersion)
+}
+
+func newK8sClient(conf types.NetConf) (*kubernetes.Clientset, error) {
+	// Some config can be passed in a kubeconfig file
+	kubeconfig := conf.Kubernetes.Kubeconfig
+
+	// Config can be overridden by config passed in explicitly in the network config.
+	configOverrides := &clientcmd.ConfigOverrides{}
+
+	// If an API root is given, make sure we're using using the name / port rather than
+	// the full URL. Earlier versions of the config required the full `/api/v1/` extension,
+	// so split that off to ensure compatibility.
+	conf.Policy.K8sAPIRoot = strings.Split(conf.Policy.K8sAPIRoot, "/api/")[0]
+
+	var overridesMap = []struct {
+		variable *string
+		value    string
+	}{
+		{&configOverrides.ClusterInfo.Server, conf.Policy.K8sAPIRoot},
+		{&configOverrides.AuthInfo.ClientCertificate, conf.Policy.K8sClientCertificate},
+		{&configOverrides.AuthInfo.ClientKey, conf.Policy.K8sClientKey},
+		{&configOverrides.ClusterInfo.CertificateAuthority, conf.Policy.K8sCertificateAuthority},
+		{&configOverrides.AuthInfo.Token, conf.Policy.K8sAuthToken},
+	}
+
+	// Using the override map above, populate any non-empty values.
+	for _, override := range overridesMap {
+		if override.value != "" {
+			*override.variable = override.value
+		}
+	}
+
+	// Also allow the K8sAPIRoot to appear under the "kubernetes" block in the network config.
+	if conf.Kubernetes.K8sAPIRoot != "" {
+		configOverrides.ClusterInfo.Server = conf.Kubernetes.K8sAPIRoot
+	}
+
+	// Use the kubernetes client code to load the kubeconfig file and combine it with the overrides.
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig},
+		configOverrides).ClientConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// Create the clientset
+	return kubernetes.NewForConfig(config)
+}
+
+func cmdAddInternal(args *skel.CmdArgs, calicoClient clientv3.Interface, k8sCLI kubernetes.Interface, ipamer utils.IPAMer, networker utils.Networker) (*current.Result, string, error) {
+	// Unmarshal the network config, and perform validation
+	conf := types.NetConf{}
+	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
+		return nil, "", fmt.Errorf("failed to load netconf: %v", err)
+	}
 
 	if !conf.NodenameFileOptional {
 		// Configured to wait for the nodename file - don't start until it exists.
 		if _, err := os.Stat("/var/lib/calico/nodename"); err != nil {
 			s := "%s: check that the calico/node container is running and has mounted /var/lib/calico/"
-			return fmt.Errorf(s, err)
+			return nil, "", fmt.Errorf(s, err)
 		}
 		logrus.Debug("/var/lib/calico/nodename exists")
 	}
@@ -123,24 +201,19 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// Extract WEP identifiers such as pod name, pod namespace (for k8s), containerID, IfName.
 	wepIDs, err := utils.GetIdentifiers(args, nodename)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 
 	logrus.WithField("EndpointIDs", wepIDs).Info("Extracted identifiers")
 
-	calicoClient, err := utils.CreateClient(conf)
-	if err != nil {
-		return err
-	}
-
 	ctx := context.Background()
 	ci, err := calicoClient.ClusterInformation().Get(ctx, "default", options.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("error getting ClusterInformation: %v", err)
+		return nil, "", fmt.Errorf("error getting ClusterInformation: %v", err)
 	}
 	if !*ci.Spec.DatastoreReady {
 		logrus.Info("Upgrade may be in progress, ready flag is not set")
-		return fmt.Errorf("Calico is currently not ready to process requests")
+		return nil, "", fmt.Errorf("Calico is currently not ready to process requests")
 	}
 
 	// Remove the endpoint field (IfName) from the wepIDs so we can get a WEP name prefix.
@@ -153,13 +226,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// for the given orchestrator.
 	wepPrefix, err := wepIDs.CalculateWorkloadEndpointName(true)
 	if err != nil {
-		return fmt.Errorf("error constructing WorkloadEndpoint prefix: %s", err)
+		return nil, "", fmt.Errorf("error constructing WorkloadEndpoint prefix: %s", err)
 	}
 
 	// Check if there's an existing endpoint by listing the existing endpoints based on the WEP name prefix.
 	endpoints, err := calicoClient.WorkloadEndpoints().List(ctx, options.ListOptions{Name: wepPrefix, Namespace: wepIDs.Namespace, Prefix: true})
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 
 	var logger *logrus.Entry
@@ -207,7 +280,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 			if err != nil {
 				// We should never hit this error, because it should have already been
 				// caught by CalculateWorkloadEndpointName.
-				return fmt.Errorf("invalid WorkloadEndpoint identifiers: %v", wepIDs.WorkloadEndpointIdentifiers)
+				return nil, "", fmt.Errorf("invalid WorkloadEndpoint identifiers: %v", wepIDs.WorkloadEndpointIdentifiers)
 			}
 
 			if match {
@@ -229,7 +302,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		wepIDs.Endpoint = args.IfName
 		wepIDs.WEPName, err = wepIDs.CalculateWorkloadEndpointName(false)
 		if err != nil {
-			return fmt.Errorf("error constructing WorkloadEndpoint name: %s", err)
+			return nil, "", fmt.Errorf("error constructing WorkloadEndpoint name: %s", err)
 		}
 	}
 
@@ -240,14 +313,14 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// If running under Kubernetes then branch off into the kubernetes code, otherwise handle everything in this
 	// function.
 	if wepIDs.Orchestrator == api.OrchestratorKubernetes {
-		if result, err = k8s.CmdAddK8s(ctx, args, conf, *wepIDs, calicoClient, endpoint); err != nil {
-			return err
+		if result, err = k8s.CmdAddK8s(ctx, args, conf, *wepIDs, k8sCLI, calicoClient, ipamer, networker, endpoint); err != nil {
+			return nil, "", err
 		}
 	} else {
 		// Default CNI behavior
 		// Validate enabled features
 		if conf.FeatureControl.IPAddrsNoIpam {
-			return errors.New("requested feature is not supported for this runtime: ip_addrs_no_ipam")
+			return nil, "", errors.New("requested feature is not supported for this runtime: ip_addrs_no_ipam")
 		}
 
 		// use the CNI network name as the Calico profile.
@@ -276,7 +349,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 			result, err = utils.CreateResultFromEndpoint(endpoint)
 			logger.WithField("result", result).Debug("Created result from endpoint")
 			if err != nil {
-				return err
+				return nil, "", err
 			}
 		} else {
 			// There's no existing endpoint, so we need to do the following:
@@ -290,7 +363,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 			ipamResult, err := ipam.ExecAdd(conf.IPAM.Type, args.StdinData)
 			logger.WithField("IPAM result", ipamResult).Info("Got result from IPAM plugin")
 			if err != nil {
-				return err
+				return nil, "", err
 			}
 
 			// Convert IPAM result into current Result.
@@ -299,13 +372,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 			// See CNI Spec doc for more details.
 			result, err = current.NewResultFromResult(ipamResult)
 			if err != nil {
-				utils.ReleaseIPAllocation(logger, conf, args)
-				return err
+				ipamer.ReleaseIPAllocation(logger, conf, args)
+				return nil, "", err
 			}
 
 			if len(result.IPs) == 0 {
-				utils.ReleaseIPAllocation(logger, conf, args)
-				return errors.New("IPAM plugin returned missing IP config")
+				ipamer.ReleaseIPAllocation(logger, conf, args)
+				return nil, "", errors.New("IPAM plugin returned missing IP config")
 			}
 
 			// Parse endpoint labels passed in by Mesos, and store in a map.
@@ -333,20 +406,20 @@ func cmdAdd(args *skel.CmdArgs) error {
 			logger.WithField("endpoint", endpoint).Debug("Populated endpoint (without nets)")
 			if err = utils.PopulateEndpointNets(endpoint, result); err != nil {
 				// Cleanup IP allocation and return the error.
-				utils.ReleaseIPAllocation(logger, conf, args)
-				return err
+				ipamer.ReleaseIPAllocation(logger, conf, args)
+				return nil, "", err
 			}
 			logger.WithField("endpoint", endpoint).Info("Populated endpoint (with nets)")
 
 			logger.Infof("Calico CNI using IPs: %s", endpoint.Spec.IPNetworks)
 
 			// 3) Set up the veth
-			hostVethName, contVethMac, err := utils.DoNetworking(
+			hostVethName, contVethMac, err := networker.DoNetworking(
 				args, conf, result, logger, "", utils.DefaultRoutes)
 			if err != nil {
 				// Cleanup IP allocation and return the error.
-				utils.ReleaseIPAllocation(logger, conf, args)
-				return err
+				ipamer.ReleaseIPAllocation(logger, conf, args)
+				return nil, "", err
 			}
 
 			logger.WithFields(logrus.Fields{
@@ -363,9 +436,9 @@ func cmdAdd(args *skel.CmdArgs) error {
 			if !endpointAlreadyExisted {
 				// Only clean up the IP allocation if this was a new endpoint.  Otherwise,
 				// we'd release the IP that is already attached to the existing endpoint.
-				utils.ReleaseIPAllocation(logger, conf, args)
+				ipamer.ReleaseIPAllocation(logger, conf, args)
 			}
-			return err
+			return nil, "", err
 		}
 
 		logger.WithField("endpoint", endpoint).Info("Wrote endpoint to datastore")
@@ -389,8 +462,8 @@ func cmdAdd(args *skel.CmdArgs) error {
 				exists = false
 			} else {
 				// Cleanup IP allocation and return the error.
-				utils.ReleaseIPAllocation(logger, conf, args)
-				return err
+				ipamer.ReleaseIPAllocation(logger, conf, args)
+				return nil, "", err
 			}
 		}
 
@@ -421,8 +494,8 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 			if _, err := calicoClient.Profiles().Create(ctx, profile, options.SetOptions{}); err != nil {
 				// Cleanup IP allocation and return the error.
-				utils.ReleaseIPAllocation(logger, conf, args)
-				return err
+				ipamer.ReleaseIPAllocation(logger, conf, args)
+				return result, conf.CNIVersion, err
 			}
 		}
 	}
@@ -435,7 +508,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	// Print result to stdout, in the format defined by the requested cniVersion.
-	return cnitypes.PrintResult(result, conf.CNIVersion)
+	return result, conf.CNIVersion, nil
 }
 
 func cmdDel(args *skel.CmdArgs) error {
@@ -444,7 +517,7 @@ func cmdDel(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to load netconf: %v", err)
 	}
 
-	utils.ConfigureLogging(conf.LogLevel)
+	utils.ConfigureLogging("debug")
 
 	if !conf.NodenameFileOptional {
 		// Configured to wait for the nodename file - don't start until it exists.
@@ -495,13 +568,15 @@ func cmdDel(args *skel.CmdArgs) error {
 		"ContainerID":      epIDs.ContainerID,
 	}).Info("Extracted identifiers")
 
+	ipamer := utils.NewIPAMer()
+
 	// Handle k8s specific bits of handling the DEL.
 	if epIDs.Orchestrator == api.OrchestratorKubernetes {
-		return k8s.CmdDelK8s(ctx, calicoClient, *epIDs, args, conf, logger)
+		return k8s.CmdDelK8s(ctx, calicoClient, *epIDs, args, conf, ipamer, logger)
 	}
 
 	// Release the IP address by calling the configured IPAM plugin.
-	ipamErr := utils.DeleteIPAM(conf, args, logger)
+	ipamErr := ipamer.DeleteIPAM(conf, args, logger)
 
 	// Delete the WorkloadEndpoint object from the datastore.
 	if _, err = calicoClient.WorkloadEndpoints().Delete(ctx, epIDs.Namespace, epIDs.WEPName, options.DeleteOptions{}); err != nil {

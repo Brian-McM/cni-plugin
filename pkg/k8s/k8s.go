@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
@@ -38,13 +37,13 @@ import (
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 // CmdAddK8s performs the "ADD" operation on a kubernetes pod
 // Having kubernetes code in its own file avoids polluting the mainline code. It's expected that the kubernetes case will
 // more special casing than the mainline code.
-func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epIDs utils.WEPIdentifiers, calicoClient calicoclient.Interface, endpoint *api.WorkloadEndpoint) (*current.Result, error) {
+func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epIDs utils.WEPIdentifiers, client kubernetes.Interface,
+	calicoClient calicoclient.Interface, ipamer utils.IPAMer, networker utils.Networker, endpoint *api.WorkloadEndpoint) (*current.Result, error) {
 	var err error
 	var result *current.Result
 
@@ -254,7 +253,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	switch {
 	case ipAddrs == "" && ipAddrsNoIpam == "":
 		// Call the IPAM plugin.
-		result, err = utils.AddIPAM(conf, args, logger)
+		result, err = ipamer.AddIPAM(conf, args, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -429,7 +428,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 // As such, we must only delete the workload endpoint when the provided CNI_CONATAINERID matches the value on the WorkloadEndpoint. If they do not match,
 // it means the DEL is for an old sandbox and the pod is still running. We should still clean up IPAM allocations, since they are identified by the
 // container ID rather than the pod name and namespace. If they do match, then we can delete the workload endpoint.
-func CmdDelK8s(ctx context.Context, c calicoclient.Interface, epIDs utils.WEPIdentifiers, args *skel.CmdArgs, conf types.NetConf, logger *logrus.Entry) error {
+func CmdDelK8s(ctx context.Context, c calicoclient.Interface, epIDs utils.WEPIdentifiers, args *skel.CmdArgs, conf types.NetConf, ipamer utils.IPAMer, logger *logrus.Entry) error {
 	wep, err := c.WorkloadEndpoints().Get(ctx, epIDs.Namespace, epIDs.WEPName, options.GetOptions{})
 	if err != nil {
 		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
@@ -479,7 +478,7 @@ func CmdDelK8s(ctx context.Context, c calicoclient.Interface, epIDs utils.WEPIde
 
 	// Release the IP address for this container by calling the configured IPAM plugin.
 	logger.Info("Releasing IP address(es)")
-	err = utils.DeleteIPAM(conf, args, logger)
+	err = ipamer.DeleteIPAM(conf, args, logger)
 	if err != nil {
 		return err
 	}
@@ -595,7 +594,7 @@ func callIPAMWithIP(ip net.IP, conf types.NetConf, args *skel.CmdArgs, logger *l
 	// so the subsequent calls don't get polluted by the old IP value.
 	if err := os.Setenv("CNI_ARGS", originalArgs); err != nil {
 		// Need to clean up IP allocation if this step doesn't succeed.
-		utils.ReleaseIPAllocation(logger, conf, args)
+		utils.NewIPAMer().ReleaseIPAllocation(logger, conf, args)
 		logger.Errorf("Error setting CNI_ARGS environment variable: %v", err)
 		return nil, err
 	}
@@ -723,54 +722,7 @@ func parseIPAddrs(ipAddrsStr string, logger *logrus.Entry) ([]string, error) {
 	return ips, nil
 }
 
-func newK8sClient(conf types.NetConf, logger *logrus.Entry) (*kubernetes.Clientset, error) {
-	// Some config can be passed in a kubeconfig file
-	kubeconfig := conf.Kubernetes.Kubeconfig
-
-	// Config can be overridden by config passed in explicitly in the network config.
-	configOverrides := &clientcmd.ConfigOverrides{}
-
-	// If an API root is given, make sure we're using using the name / port rather than
-	// the full URL. Earlier versions of the config required the full `/api/v1/` extension,
-	// so split that off to ensure compatibility.
-	conf.Policy.K8sAPIRoot = strings.Split(conf.Policy.K8sAPIRoot, "/api/")[0]
-
-	var overridesMap = []struct {
-		variable *string
-		value    string
-	}{
-		{&configOverrides.ClusterInfo.Server, conf.Policy.K8sAPIRoot},
-		{&configOverrides.AuthInfo.ClientCertificate, conf.Policy.K8sClientCertificate},
-		{&configOverrides.AuthInfo.ClientKey, conf.Policy.K8sClientKey},
-		{&configOverrides.ClusterInfo.CertificateAuthority, conf.Policy.K8sCertificateAuthority},
-		{&configOverrides.AuthInfo.Token, conf.Policy.K8sAuthToken},
-	}
-
-	// Using the override map above, populate any non-empty values.
-	for _, override := range overridesMap {
-		if override.value != "" {
-			*override.variable = override.value
-		}
-	}
-
-	// Also allow the K8sAPIRoot to appear under the "kubernetes" block in the network config.
-	if conf.Kubernetes.K8sAPIRoot != "" {
-		configOverrides.ClusterInfo.Server = conf.Kubernetes.K8sAPIRoot
-	}
-
-	// Use the kubernetes client code to load the kubeconfig file and combine it with the overrides.
-	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig},
-		configOverrides).ClientConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	// Create the clientset
-	return kubernetes.NewForConfig(config)
-}
-
-func getK8sNSInfo(client *kubernetes.Clientset, podNamespace string) (annotations map[string]string, err error) {
+func getK8sNSInfo(client kubernetes.Interface, podNamespace string) (annotations map[string]string, err error) {
 	ns, err := client.CoreV1().Namespaces().Get(podNamespace, metav1.GetOptions{})
 	logrus.Infof("namespace info %+v", ns)
 	if err != nil {
@@ -779,7 +731,7 @@ func getK8sNSInfo(client *kubernetes.Clientset, podNamespace string) (annotation
 	return ns.Annotations, nil
 }
 
-func getK8sPodInfo(client *kubernetes.Clientset, podName, podNamespace string) (labels map[string]string, annotations map[string]string, ports []api.EndpointPort, profiles []string, generateName string, err error) {
+func getK8sPodInfo(client kubernetes.Interface, podName, podNamespace string) (labels map[string]string, annotations map[string]string, ports []api.EndpointPort, profiles []string, generateName string, err error) {
 	pod, err := client.CoreV1().Pods(string(podNamespace)).Get(podName, metav1.GetOptions{})
 	logrus.Infof("pod info %+v", pod)
 	if err != nil {
@@ -800,7 +752,7 @@ func getK8sPodInfo(client *kubernetes.Clientset, podName, podNamespace string) (
 	return labels, pod.Annotations, ports, profiles, generateName, nil
 }
 
-func getPodCidr(client *kubernetes.Clientset, conf types.NetConf, nodename string) (string, error) {
+func getPodCidr(client kubernetes.Interface, conf types.NetConf, nodename string) (string, error) {
 	// Pull the node name out of the config if it's set. Defaults to nodename
 	if conf.Kubernetes.NodeName != "" {
 		nodename = conf.Kubernetes.NodeName
