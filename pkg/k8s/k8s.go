@@ -36,6 +36,7 @@ import (
 	cnet "github.com/projectcalico/libcalico-go/lib/net"
 	"github.com/projectcalico/libcalico-go/lib/options"
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -66,6 +67,22 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		return nil, err
 	}
 	logger.WithField("client", client).Debug("Created Kubernetes client")
+
+	pod, err := client.CoreV1().Pods(epIDs.Namespace).Get(epIDs.Pod, metav1.GetOptions{})
+	logrus.Infof("pod info %+v", pod)
+	if err != nil {
+		return nil, err
+	}
+
+	netConfig, err := k8sconversion.CalicoInterfaceNetworkConfigForPodInterface(pod, args.IfName)
+	if err != nil {
+		return nil, err
+	} else if netConfig == nil {
+		netConfig, err = k8sconversion.DefaultCalicoInterfaceNetworkConfigForPod(pod)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	var routes []*net.IPNet
 	if conf.IPAM.Type == "host-local" {
@@ -144,7 +161,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 
 	// Determine which routes to program within the container. If no routes were provided in the CNI config,
 	// then use the Calico default routes. If routes were provided then program those instead.
-	if len(routes) == 0 {
+	if len(routes) == 0 && netConfig.IsDefaultInterface {
 		logger.Debug("No routes specified in CNI configuration, using defaults.")
 		routes = utils.DefaultRoutes
 	} else {
@@ -174,7 +191,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		}
 		logger.WithField("NS Annotations", annotNS).Debug("Fetched K8s namespace annotations")
 
-		labels, annot, ports, profiles, generateName, err = getK8sPodInfo(client, epIDs.Pod, epIDs.Namespace)
+		labels, annot, ports, profiles, generateName, err = getK8sPodInfo(pod)
 		if err != nil {
 			return nil, err
 		}
@@ -364,9 +381,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		utils.ReleaseIPAllocation(logger, conf, args)
 	}
 
-	// Whether the endpoint existed or not, the veth needs (re)creating.
-	hostVethName := k8sconversion.VethNameForWorkload(epIDs.Namespace, epIDs.Pod)
-	_, contVethMac, err := utils.DoNetworking(args, conf, result, logger, hostVethName, routes)
+	_, contVethMac, err := utils.DoNetworking(args, conf, result, logger, netConfig.HostSideIfaceName, routes, netConfig.InsidePodGW)
 	if err != nil {
 		logger.WithError(err).Error("Error setting up networking")
 		releaseIPAM()
@@ -380,7 +395,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		return nil, err
 	}
 	endpoint.Spec.MAC = mac.String()
-	endpoint.Spec.InterfaceName = hostVethName
+	endpoint.Spec.InterfaceName = netConfig.HostSideIfaceName
 	endpoint.Spec.ContainerID = epIDs.ContainerID
 	logger.WithField("endpoint", endpoint).Info("Added Mac, interface name, and active container ID to endpoint")
 
@@ -409,7 +424,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	}
 
 	// Write the endpoint object (either the newly created one, or the updated one)
-	if _, err := utils.CreateOrUpdate(ctx, calicoClient, endpoint); err != nil {
+	if _, err := utils.CreateOrUpdate(ctx, calicoClient, endpoint, netConfig.IsDefaultInterface); err != nil {
 		logger.WithError(err).Error("Error creating/updating endpoint in datastore.")
 		releaseIPAM()
 		return nil, err
@@ -417,8 +432,15 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	logger.Info("Wrote updated endpoint to datastore")
 
 	// Add the interface created above to the CNI result.
-	result.Interfaces = append(result.Interfaces, &current.Interface{
-		Name: endpoint.Spec.InterfaceName},
+	result.Interfaces = append(result.Interfaces,
+		&current.Interface{
+			Name: endpoint.Spec.InterfaceName,
+		},
+		&current.Interface{
+			Name:    args.IfName,
+			Sandbox: args.Netns,
+			Mac:     contVethMac,
+		},
 	)
 
 	return result, nil
@@ -779,15 +801,9 @@ func getK8sNSInfo(client *kubernetes.Clientset, podNamespace string) (annotation
 	return ns.Annotations, nil
 }
 
-func getK8sPodInfo(client *kubernetes.Clientset, podName, podNamespace string) (labels map[string]string, annotations map[string]string, ports []api.EndpointPort, profiles []string, generateName string, err error) {
-	pod, err := client.CoreV1().Pods(string(podNamespace)).Get(podName, metav1.GetOptions{})
-	logrus.Infof("pod info %+v", pod)
-	if err != nil {
-		return nil, nil, nil, nil, "", err
-	}
-
+func getK8sPodInfo(pod *corev1.Pod) (labels map[string]string, annotations map[string]string, ports []api.EndpointPort, profiles []string, generateName string, err error) {
 	var c k8sconversion.Converter
-	kvp, err := c.PodToWorkloadEndpoint(pod)
+	kvp, err := c.PodToDefaultWorkloadEndpoint(pod)
 	if err != nil {
 		return nil, nil, nil, nil, "", err
 	}

@@ -88,12 +88,20 @@ func nodenameFromFile() string {
 
 // CreateOrUpdate creates the WorkloadEndpoint if ResourceVersion is not specified,
 // or Update if it's specified.
-func CreateOrUpdate(ctx context.Context, client client.Interface, wep *api.WorkloadEndpoint) (*api.WorkloadEndpoint, error) {
-	if wep.ResourceVersion != "" {
-		return client.WorkloadEndpoints().Update(ctx, wep, options.SetOptions{})
+func CreateOrUpdate(ctx context.Context, client client.Interface, wep *api.WorkloadEndpoint, isDefault bool) (*api.WorkloadEndpoint, error) {
+	if isDefault {
+		if wep.ResourceVersion != "" {
+			return client.WorkloadEndpoints().Update(ctx, wep, options.SetOptions{})
+		}
+
+		return client.WorkloadEndpoints().Create(ctx, wep, options.SetOptions{})
 	}
 
-	return client.WorkloadEndpoints().Create(ctx, wep, options.SetOptions{})
+	if wep.ResourceVersion != "" {
+		return client.WorkloadEndpoints().UpdateNonDefault(ctx, wep, options.SetOptions{})
+	}
+
+	return client.WorkloadEndpoints().CreateNonDefault(ctx, wep, options.SetOptions{})
 }
 
 // AddIPAM calls through to the configured IPAM plugin.
@@ -454,13 +462,22 @@ func GetIdentifiers(args *skel.CmdArgs, nodename string) (*WEPIdentifiers, error
 	return &epIDs, nil
 }
 
-func GetHandleID(netName, containerID, workload string) string {
-	handleID := fmt.Sprintf("%s.%s", netName, containerID)
+// GetHandleID creates an IPAM handle from the given parameters. If the endpoint is non empty, then the format will be
+// <netName>.<containerID>.<endpoint>, otherwise the legacy format of <netName>.<containerID> is used
+func GetHandleID(netName, containerID, workload, endpoint string) string {
+	var handleID string
+	if endpoint == "" {
+		handleID = fmt.Sprintf("%s.%s", netName, containerID)
+	} else {
+		handleID = fmt.Sprintf("%s.%s.%s", netName, containerID, endpoint)
+	}
+
 	logrus.WithFields(logrus.Fields{
 		"HandleID":    handleID,
 		"Network":     netName,
 		"Workload":    workload,
 		"ContainerID": containerID,
+		"Endpoint":    endpoint,
 	}).Debug("Generated IPAM handle")
 	return handleID
 }

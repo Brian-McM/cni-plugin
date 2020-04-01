@@ -40,6 +40,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 const testConnectionTimeout = 2 * time.Second
@@ -101,6 +103,7 @@ func testConnection() error {
 
 func cmdAdd(args *skel.CmdArgs) error {
 	// Unmarshal the network config, and perform validation
+	logrus.Info("BRIANMARK")
 	conf := types.NetConf{}
 	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
 		return fmt.Errorf("failed to load netconf: %v", err)
@@ -147,7 +150,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	// We use the WEP name prefix (e.g. prefix: "node1-k8s-mypod--1-", full name: "node1-k8s-mypod--1-eth0"
 	// to list all the WEPs so if we have a WEP with a different IfName (e.g. "node1-k8s-mypod--1-eth1")
 	// we could still get that.
-	wepIDs.Endpoint = ""
+	//wepIDs.Endpoint = ""
 
 	// Calculate the workload name prefix from the WEP specific identifiers
 	// for the given orchestrator.
@@ -155,11 +158,16 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if err != nil {
 		return fmt.Errorf("error constructing WorkloadEndpoint prefix: %s", err)
 	}
+	//endpoints, err := calicoClient.WorkloadEndpoints().List(ctx, options.ListOptions{Name: wepPrefix, Namespace: wepIDs.Namespace, Prefix: true})
 
 	// Check if there's an existing endpoint by listing the existing endpoints based on the WEP name prefix.
-	endpoints, err := calicoClient.WorkloadEndpoints().List(ctx, options.ListOptions{Name: wepPrefix, Namespace: wepIDs.Namespace, Prefix: true})
-	if err != nil {
-		return err
+	endpoint, err := calicoClient.WorkloadEndpoints().Get(ctx, wepIDs.Namespace, wepIDs.WEPName, options.GetOptions{})
+	if err != nil && kerrors.IsNotFound(err) {
+		if !kerrors.IsNotFound(err) {
+			return err
+		}
+
+		endpoint = nil
 	}
 
 	var logger *logrus.Entry
@@ -174,53 +182,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 		logger = logrus.WithFields(logrus.Fields{
 			"ContainerID": wepIDs.ContainerID,
 		})
-	}
-
-	logger.Debugf("Retrieved list of endpoints: %v", endpoints)
-
-	var endpoint *api.WorkloadEndpoint
-
-	// If the prefix list returns 1 or more items, we go through the items and try to see if the name matches the WEP
-	// identifiers we have. The identifiers we use for this match at this point are:
-	// 1. Node name
-	// 2. Orchestrator ID ('cni' or 'k8s')
-	// 3. ContainerID
-	// 4. Pod name (only for k8s)
-	// Note we don't use the interface name (endpoint) for this match.
-	// If we find a match from the returned list then we've found the workload endpoint,
-	// and we reuse that even if it has a different interface name, because
-	// we only support one interface per pod right now.
-	// For example, you have a WEP for a k8s pod "mypod-1", and IfName "eth0" on node "node1", that will result in
-	// a WEP name "node1-k8s-mypod--1-eth0" in the datastore, now you're trying to schedule another pod "mypod",
-	// IfName "eth0" and node "node1", so we do a prefix list to get all the endpoints for that workload, with
-	// the prefix "node1-k8s-mypod-". Now this search would return any existing endpoints for "mypod", but it will also
-	// list "node1-k8s-mypod--1-eth0" which is not the same WorkloadEndpoint, so to avoid that, we go through the
-	// list of returned WEPs from the prefix list and call NameMatches() based on all the
-	// identifiers (pod name, containerID, node name, orchestrator), but omit the IfName (Endpoint field) since we can
-	// only have one interface per pod right now, and NameMatches() will return true if the WEP matches the identifiers.
-	// It is possible that none of the WEPs in the list match the identifiers, which means we don't already have an
-	// existing WEP to reuse. See `names.WorkloadEndpointIdentifiers` GoDoc comments for more details.
-	if len(endpoints.Items) > 0 {
-		logger.Debugf("List of WorkloadEndpoints %v", endpoints.Items)
-		for _, ep := range endpoints.Items {
-			match, err := wepIDs.WorkloadEndpointIdentifiers.NameMatches(ep.Name)
-			if err != nil {
-				// We should never hit this error, because it should have already been
-				// caught by CalculateWorkloadEndpointName.
-				return fmt.Errorf("invalid WorkloadEndpoint identifiers: %v", wepIDs.WorkloadEndpointIdentifiers)
-			}
-
-			if match {
-				logger.Debugf("Found a match for WorkloadEndpoint: %v", ep)
-				endpoint = &ep
-				// Assign the WEP name to wepIDs' WEPName field.
-				wepIDs.WEPName = endpoint.Name
-				// Put the endpoint name from the matched WEP in the identifiers.
-				wepIDs.Endpoint = ep.Spec.Endpoint
-				logger.Infof("Calico CNI found existing endpoint: %v", endpoint)
-				break
-			}
-		}
 	}
 
 	// If we don't find a match from the existing WorkloadEndpoints then we calculate
@@ -342,7 +303,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 			// 3) Set up the veth
 			hostVethName, contVethMac, err := utils.DoNetworking(
-				args, conf, result, logger, "", utils.DefaultRoutes)
+				args, conf, result, logger, "", utils.DefaultRoutes, nil)
 			if err != nil {
 				// Cleanup IP allocation and return the error.
 				utils.ReleaseIPAllocation(logger, conf, args)
@@ -359,7 +320,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 
 		// Write the endpoint object (either the newly created one, or the updated one with a new ProfileIDs).
-		if _, err := utils.CreateOrUpdate(ctx, calicoClient, endpoint); err != nil {
+		if _, err := utils.CreateOrUpdate(ctx, calicoClient, endpoint, true); err != nil {
 			if !endpointAlreadyExisted {
 				// Only clean up the IP allocation if this was a new endpoint.  Otherwise,
 				// we'd release the IP that is already attached to the existing endpoint.
@@ -512,7 +473,6 @@ func cmdDel(args *skel.CmdArgs) error {
 			return err
 		}
 	}
-
 	// Clean up namespace by removing the interfaces.
 	err = utils.CleanUpNamespace(args, logger)
 	if err != nil {

@@ -62,6 +62,7 @@ func DoNetworking(
 	logger *logrus.Entry,
 	desiredVethName string,
 	routes []*net.IPNet,
+	ipv4GW net.IP,
 ) (hostVethName, contVethMAC string, err error) {
 	// Select the first 11 characters of the containerID for the host veth.
 	hostVethName = "cali" + args.ContainerID[:Min(11, len(args.ContainerID))]
@@ -145,8 +146,11 @@ func DoNetworking(
 		// Do the per-IP version set-up.  Add gateway routes etc.
 		if hasIPv4 {
 			// Add a connected route to a dummy next hop so that a default route can be set
-			gw := net.IPv4(169, 254, 1, 1)
-			gwNet := &net.IPNet{IP: gw, Mask: net.CIDRMask(32, 32)}
+			if ipv4GW == nil {
+				ipv4GW = net.IPv4(169, 254, 1, 1)
+			}
+
+			gwNet := &net.IPNet{IP: ipv4GW, Mask: net.CIDRMask(32, 32)}
 			err := netlink.RouteAdd(
 				&netlink.Route{
 					LinkIndex: contVeth.Attrs().Index,

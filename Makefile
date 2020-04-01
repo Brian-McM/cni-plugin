@@ -26,9 +26,9 @@ ifdef LOCAL_BUILD
 PHONY: set-up-local-build
 LOCAL_BUILD_DEP:=set-up-local-build
 
-EXTRA_DOCKER_ARGS+=-v $(CURDIR)/../libcalico-go:/go/src/github.com/projectcalico/libcalico-go:rw
+EXTRA_DOCKER_ARGS+=-v /home/brian/go-private/src/github.com/tigera/libcalico-go-private:/home/brian/go-private/src/github.com/tigera/libcalico-go-private:rw
 $(LOCAL_BUILD_DEP):
-	$(DOCKER_RUN) $(CALICO_BUILD) go mod edit -replace=github.com/projectcalico/libcalico-go=../libcalico-go
+	$(DOCKER_RUN) $(CALICO_BUILD) go mod edit -replace=github.com/projectcalico/libcalico-go=/home/brian/go-private/src/github.com/tigera/libcalico-go-private
 endif
 
 include Makefile.common
@@ -180,7 +180,6 @@ sub-tag-images-%:
 ###############################################################################
 ## Run the unit tests.
 ut: run-k8s-controller build $(BIN)/host-local
-	$(MAKE) ut-datastore DATASTORE_TYPE=etcdv3
 	$(MAKE) ut-datastore DATASTORE_TYPE=kubernetes
 
 ut-datastore: $(LOCAL_BUILD_DEP)
@@ -197,6 +196,7 @@ ut-datastore: $(LOCAL_BUILD_DEP)
 	-e K8S_API_ENDPOINT=http://127.0.0.1:8080 \
 	-e GO111MODULE=on \
 	-v $(CURDIR):/go/src/$(PACKAGE_NAME):rw \
+	-v /home/brian/go-private/src/github.com/tigera/libcalico-go-private:/home/brian/go-private/src/github.com/tigera/libcalico-go-private:rw \
 	$(CALICO_BUILD) sh -c '\
 			cd  /go/src/$(PACKAGE_NAME) && \
 			ginkgo -cover -r -skipPackage vendor -skipPackage k8s-install $(GINKGO_ARGS)'

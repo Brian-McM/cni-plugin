@@ -2192,7 +2192,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 
 		checkIPAMReservation := func() {
 			// IPAM reservation should still be in place.
-			handleID := utils.GetHandleID("calico-uts", containerID, workloadName)
+			handleID := utils.GetHandleID("calico-uts", containerID, "eth0", workloadName)
 			ipamIPs, err := calicoClient.IPAM().IPsByHandle(context.Background(), handleID)
 			ExpectWithOffset(1, err).NotTo(HaveOccurred(), "error getting IPs")
 			ExpectWithOffset(1, ipamIPs).To(HaveLen(1),
@@ -2227,6 +2227,8 @@ var _ = Describe("Kubernetes CNI tests", func() {
 			Expect(err).NotTo(HaveOccurred())
 			clientset, err = kubernetes.NewForConfig(config)
 			Expect(err).NotTo(HaveOccurred())
+			// Make sure the namespace exists.
+			ensureNamespace(clientset, testutils.K8S_TEST_NS)
 			name = fmt.Sprintf("run%d", rand.Uint32())
 			pod := ensurePodCreated(clientset, testutils.K8S_TEST_NS,
 				&v1.Pod{
@@ -2283,7 +2285,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 			ensurePodDeleted(clientset, testutils.K8S_TEST_NS, name)
 		})
 
-		It("a second ADD for the same container should work, assigning a new IP", func() {
+		FIt("a second ADD for the same container should work, assigning a new IP", func() {
 			// Try to create the same pod with a different container (so CNI receives the ADD for the same endpoint again)
 			resultSecondAdd, _, _, _, err := testutils.RunCNIPluginWithId(netconf, name, testutils.K8S_TEST_NS, "", "new-container-id", "eth0", contNs)
 			Expect(err).NotTo(HaveOccurred())
@@ -2295,6 +2297,13 @@ var _ = Describe("Kubernetes CNI tests", func() {
 			// Otherwise, they should be the same.
 			resultSecondAdd.IPs = nil
 			result.IPs = nil
+			for _, iface := range result.Interfaces {
+				iface.Mac = ""
+			}
+			for _, iface := range resultSecondAdd.Interfaces {
+				iface.Mac = ""
+			}
+
 			Expect(resultSecondAdd).Should(Equal(result))
 
 			// IPAM reservation should still be in place.
